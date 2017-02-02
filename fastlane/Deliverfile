@@ -1,0 +1,36 @@
+# Everything is handled here
+# except:
+# - screenshots
+# - contact metadata
+
+# Basic app review metadata
+app_review_information(
+  first_name: "Tom",
+  last_name: "Frew",
+  phone_number: "+447901711814",
+  email_address: "tom@manandmoon.com",
+  demo_user: "apple@manandmoon.com",
+  demo_password: "apple123",
+  notes: "You will need to emulate your location to central London.\n" \
+         "The venues are currently offline so orders will not be responded to. " \
+         "Since application uses production credentials, you won't be able to place any orders " \
+         "as long as real card is not provided. We have made a couple of sample orders for you " \
+         "to check out in the `Orders` tab\n\n" \
+         "If you need to please contact us and we can manually move an order through the accepted process."
+)
+
+# Rating
+app_rating_config_path "./fastlane/metadata/rating.json"
+
+# Price tier
+price_tier 0
+
+# Copyright + year
+copyright "#{Time.now.year} Adbibio Ltd"
+
+# Categories
+primary_category "Apps.Food_Drink"
+secondary_category "Lifestyle"
+
+# Automatically release when apple accepts it
+automatic_release true

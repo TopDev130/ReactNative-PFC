@@ -1,0 +1,324 @@
+fastlane_version "1.10.0"
+
+project_file = "./platforms/ios/este.xcodeproj"
+workspace_file = "./platforms/ios/este.xcworkspace"
+project_folder = "./platforms/ios";
+plist_file = "#{project_folder}/Info.plist"
+
+default_platform :ios
+
+# Private: Generates random build number
+#
+# Example:
+#
+#    random_build_number
+#    # => '2015.02.13.14.53'
+#
+# Returns combination of current date
+def random_build_number
+  Time.new.strftime("%Y.%m.%d.%H.%M")
+end
+
+# Private: Make sure envs are set before continuing
+#
+# envs - An array of strings indicating names of envs to check
+#
+# Example:
+#
+#     ensure_env ["APP_ID"]
+#     # => true
+#
+# Throws an error when variable is not set, otherwise returns true
+def ensure_env(envs)
+  envs.each do |env|
+    raise "Variable `#{env}` is not set!".red if !ENV[env]
+  end
+  true
+end
+
+# Private: Extracts version details from a given version string
+#
+# version_string - A string containing version data from Changelog.md
+#
+# Example:
+#
+#   extract_version_details("1.0.0-ota2\n\nDesc")
+#   # => {release_notes: 'Desc', version_number: '1.0.0', ota_number: '2', git_branch: 'v1.0.0'}
+#
+# Returns a dictionary with version details
+def extract_version_details(version_string)
+  version_number = version_string.split("\n").first.split("-ota")
+  release_notes = version_string.split("\n")[2..-1].join("\n")
+  {
+    release_notes: release_notes,
+    version_number: version_number[0],
+    ota_number: version_number[1],
+    git_branch: "v#{version_number[0]}"
+  }
+end
+
+# Private: Extract latest version from given Changelog file
+#
+# changelog_file - Relative to current directory path with changelog
+#
+# Example:
+#
+#   latest_version('../Changelog.md')
+#   # =>  {release_notes: 'Desc', version_number: '1.0.1', ota_number: nil, git_branch: 'v1.0.1'}
+#
+# Returns version details of the latest non OTA version
+def latest_version(changelog_file)
+  _, *changelog = File.read(changelog_file).split("\n## ")
+
+  latest_version = changelog
+    .select { |v| !v.split("\n").first.include? "ota" }
+    .shift
+
+  extract_version_details latest_version
+end
+
+# Private: Extract latest OTA version from given Changelog file
+#
+# changelog_file - Relative to current directory path with changelog
+# version - Version to look for OTA
+#
+# Example:
+#
+#   latest_version('../Changelog.md', 'v1.0.1')
+#   # =>  {release_notes: 'Desc', version_number: '1.0.1', ota_number: 2, git_branch: 'v1.0.1'}
+#
+# Returns version details of the latest OTA version
+def latest_ota_version(changelog_file, version)
+  _, *changelog = File.read(changelog_file).split("\n## ")
+
+  version_number = version.delete! "v"
+  version_expr = /#{version_number}-ota([1-9][0-9]*)/
+
+  latest_version = changelog
+    .select { |v| v.split("\n").first =~ version_expr }
+    .shift
+
+  extract_version_details latest_version
+end
+
+# Private: Gets branch by calling underlying git client
+#
+# Example:
+#
+#   current_branch
+#   # => master
+#
+# Returns current branch
+def current_branch
+  sh("git rev-parse --abbrev-ref HEAD").strip
+end
+
+# Private: Ensures we are on the version branch
+#
+# Example:
+#
+#   ensure_version_branch
+#   # => nil
+#
+# Throws when current branch name does not follow semver naming (e.g. v1.0.0)
+def ensure_version_branch
+  branch = current_branch
+  branch_expr = /v([1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)/
+  if branch =~ branch_expr
+    Helper.log.info "We are on a version branch -> `#{branch}`, all good! 💪".green
+  else
+    raise "Git is not on a version branch, but `#{branch}` instead!".red
+  end
+end
+
+platform :ios do
+
+  # Install cocoapods before any lane
+  # And ensure all required envs are set
+  before_all do
+    ensure_env ["APPHUB_SECRET", "NPM_TOKEN"]
+    ensure_git_status_clean
+    cocoapods(
+      podfile: project_folder,
+      silent: true
+    )
+  end
+
+  desc "Upload IPA file to AppHub"
+  private_lane :apphub do |options|
+    ipa_location = lane_context[SharedValues::IPA_OUTPUT_PATH]
+    app_id = get_info_plist_value key: "AppHubID", path: plist_file
+
+    curl_cmd = "curl -X PUT " \
+               "-H 'X-AppHub-Application-ID: #{app_id}' " \
+               "-H 'X-AppHub-Application-Secret: #{ENV["APPHUB_SECRET"]}' " \
+               "-H 'X-AppHub-Build-Metadata: { " \
+               "     \"target\": \"#{options[:target]}\", " \
+               "     \"description\": \"#{options[:release_notes]}\" " \
+               "}' " \
+               "-L https://api.apphub.io/v1/upload " \
+               "--upload-file #{ipa_location} "
+
+    sh curl_cmd
+  end
+
+  desc "Build IPA file"
+  private_lane :build_ipa do |options|
+
+    # Get latest production-grade provisioning profile
+    sigh adhoc: options[:hockey], output_path: "/tmp"
+
+    # Update provisioning profile used in the project
+    ENV["PROFILE_UDID"] = lane_context[SharedValues::SIGH_UDID]
+
+    # Build app
+    gym(
+      workspace: workspace_file,
+      configuration: "Release",
+      scheme: "este",
+      clean: true,
+      silent: true,
+      output_directory: "/tmp"
+    )
+
+  end
+
+  desc "Send over OTA update"
+  desc "This action should be called from non-master (build) branch"
+  lane :ota do
+    # Make sure we are on the version branch
+    ensure_version_branch
+
+    version = current_branch
+
+    build = latest_ota_version "../Changelog.md", version
+
+    build_number = random_build_number
+
+    # Bump build number only
+    increment_build_number(
+      xcodeproj: project_file,
+      build_number: build_number
+    )
+
+    # Build IPA
+    build_ipa
+
+    # Update version in Git
+    commit_version_bump(
+      message: "[ci-skip] OTA: #{build[:ota_version]}",
+      xcodeproj: project_file
+    )
+
+    # Commit changes
+    push_to_git_remote local_branch: build[:git_branch]
+
+    # Send OTA to apphub
+    apphub(
+      release_notes: build[:release_notes],
+      target: "all"
+    )
+
+    # Clean build artifacts
+    clean_build_artifacts
+  end
+
+  desc "Send new release to Hockey app"
+  lane :hockey do
+
+    # Extract metadata from readme
+    build = latest_version "../Changelog.md"
+
+    # We start off from master
+    ensure_git_branch
+
+    increment_version_number(
+      version_number: build[:version_number],
+      xcodeproj: project_file
+    )
+
+    increment_build_number(
+      xcodeproj: project_file,
+      build_number: random_build_number
+    )
+
+    build_ipa hockey: true
+
+    hockey(
+      api_token: 'e0c084f7fbbc4a4c8a1fc19fabcb58ca',
+      notes: build[:release_notes]
+    )
+
+    clean_build_artifacts
+  end
+
+  desc "Craft full AppStore release"
+  desc "This action should be called from master branch"
+  lane :release do
+
+    # Extract metadata from readme
+    build = latest_version "../Changelog.md"
+
+    # We start off from master
+    ensure_git_branch
+
+    # Let's make branch for that version
+    sh "git checkout -b #{build[:git_branch]}"
+
+    # Ensure successful
+    ensure_git_branch branch: build[:git_branch]
+
+    increment_version_number(
+      version_number: build[:version_number],
+      xcodeproj: project_file
+    )
+
+    increment_build_number(
+      xcodeproj: project_file,
+      build_number: random_build_number
+    )
+
+    # Build IPA
+    build_ipa
+
+    # Send App to iTunes Connect
+    deliver(
+      submit_for_review: false,
+      force: true,
+      metadata_path: "./fastlane/metadata"
+    )
+
+    # Set release notes for all languages
+    set_changelog(
+      version: build[:version_number],
+      changelog: build[:release_notes]
+    )
+
+    # Update version in Git
+    commit_version_bump(
+      message: "[ci-skip] Bump: #{build[:version_number]}",
+      xcodeproj: project_file
+    )
+
+    # Push new branch to origin
+    push_to_git_remote local_branch: build[:git_branch]
+
+    # Add in Github release
+    set_github_release(
+      repository_name: "Adbibio/pfc-mobile",
+      api_token: ENV["NPM_TOKEN"],
+      name: "Release v#{build[:version_number]}",
+      tag_name: build[:version_number],
+      description: build[:release_notes],
+      commitish: build[:git_branch],
+      upload_assets: [lane_context[SharedValues::IPA_OUTPUT_PATH]]
+    )
+
+    clean_build_artifacts
+
+    # Go back to master and ensure we are there
+    sh "git checkout master"
+    ensure_git_branch
+  end
+
+end

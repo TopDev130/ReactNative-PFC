@@ -1,0 +1,17 @@
+machine:
+  xcode:
+    version: "7.0"
+
+dependencies:
+  pre:
+    - curl -o- https://raw.githubusercontent.com/creationix/nvm/v0.26.1/install.sh | NVM_DIR=/usr/local/nvm bash
+    - nvm install 4.0.0
+    - nvm alias default 4.0.0
+    - source ~/.bashrc
+    - npm install -g npm@3.x
+    - npm cache clean
+    - npm install
+
+test:
+  override:
+    - npm test
